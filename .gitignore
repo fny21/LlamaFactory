@@ -181,3 +181,8 @@ wandb/
 swanlog/
 generated_predictions.jsonl
 predictions_score.json
+
+action_sort_eval_results/
+eval_result/
+image_and_feature/
+puzzle_dataset/

@@ -20,7 +20,8 @@ class DeepseekClient:
         system_content: str = "You are a helpful assistant",
         model: str = "deepseek-v4-pro",
         stream: bool = False,
-        reasoning_effort: str = "high"
+        reasoning_effort: str = "high",
+        max_retries: int = 20
     ):
         """
         调用 Deepseek 对话接口
@@ -29,19 +30,26 @@ class DeepseekClient:
         :param model: 模型名称
         :param stream: 是否流式输出
         :param reasoning_effort: 推理力度
+        :param max_retries: 最大重试次数
         :return: 模型返回的回答内容
         """
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": user_content},
-            ],
-            stream=stream,
-            reasoning_effort=reasoning_effort,
-            extra_body={"thinking": {"type": "enabled"}}
-        )
-        return response.choices[0].message.content
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": user_content},
+                    ],
+                    stream=stream,
+                    reasoning_effort=reasoning_effort,
+                    extra_body={"thinking": {"type": "enabled"}}
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    return f"错误: {e}"
+                print(f"重试 {attempt+1}/{max_retries} 错误: {e}")
     
 
 # client = DeepseekClient()

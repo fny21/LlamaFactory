@@ -51,8 +51,7 @@ def main(args):
     )
 
     # 2. 初始化统计变量
-    correct_num = 0
-    wrong_num = 0
+    processed_num = 0
 
     # 3. 遍历输入文件
     data_list = []
@@ -79,14 +78,33 @@ def main(args):
     for input_file in tqdm(sampled_data, total=len(sampled_data)):
 
         images = input_file["images"]
-        raw_images = [Image.open(os.path.join(args.input_image_dir, image_path)).convert("RGB") for image_path in images]
+        raw_images = [pil_img2rgb(Image.open(os.path.join(args.input_image_dir, image_path))) for image_path in images]
 
-        # 二倍分辨率
-        resized_images = [img.resize((2 * img.width, 2 * img.height)) for img in raw_images]
-        raw_images = resized_images
+        sample_id = str(input_file["id"])
+        sample_output_dir = os.path.join(output_info_path, sample_id)
+        os.makedirs(sample_output_dir, exist_ok=True)
+
+        # 按输入模型时的顺序保存图片，便于人工核对。
+        image_name_lines = []
+        for image_index, (image_path, image) in enumerate(zip(images, raw_images), start=1):
+            if image_index == 1:
+                save_name = f"image_{image_index:02d}_initial.png"
+            else:
+                save_name = f"image_{image_index:02d}.png"
+
+            save_path = os.path.join(sample_output_dir, save_name)
+            image.save(save_path)
+            image_name_lines.append(f"{save_name} <- {image_path}")
 
         # 处理文本
-        puzzle_prompt = input_file["question"]
+        compare_prompt = "You will see a set of images, which are screenshots of a robotic arm's operation process. " \
+        "The first image is the initial image, and each subsequent image represents a scene after the robotic arm " \
+        "has completed several operations (except for the first image, the order of the images has been shuffled, " \
+        "so the images do not necessarily appear in sequential order). For each image except the initial one, " \
+        "please carefully compare it with the initial image and describe the differences in detail. " \
+        "(Note: You should focus on the differences that indicate what action the robotic arm has completed, " \
+        "such as what is added to the bag or what the robotic arm is holding. Minor pixel differences due to camera " \
+        "shake are not within the scope of consideration). Please output the key differences for each image in sequence."
         
         # 构建 vLLM 输入格式：文本 + 图像路径/对象
         messages = [
@@ -95,20 +113,13 @@ def main(args):
                 "content": []
             }
         ]
-        messages[0]["content"].append(
-            {"type": "text", "text": puzzle_prompt + "\nCurrent State Image:"}
-        )
-        messages[0]["content"].append(
-            {"type": "image"}
-        )
-        messages[0]["content"].append(
-            {"type": "text", "text": "Future State Images:"}
-        )
+        messages[0]["content"].append({"type": "text", "text": compare_prompt})
+        messages[0]["content"].append({"type": "text", "text": "Image 1 (Initial):"})
+        messages[0]["content"].append({"type": "image"})
 
-        for _ in range(len(raw_images)-1):
-            messages[0]["content"].append(
-                {"type": "image"}
-            )
+        for image_index in range(2, len(raw_images) + 1):
+            messages[0]["content"].append({"type": "text", "text": f"Image {image_index}:"})
+            messages[0]["content"].append({"type": "image"})
 
         text = processor.apply_chat_template(
             messages,
@@ -129,7 +140,7 @@ def main(args):
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=32768,
+                max_new_tokens=2048,
                 do_sample=True,
                 temperature=0.2
             )
@@ -143,20 +154,16 @@ def main(args):
 
         model_output = output_text.strip()
 
-        # 计算正确答案
-        gt_answer = str(input_file['gt_answer'])
-        model_answer = model_output.split("Final Answer:")[-1].strip().split("</think>")[-1].strip()
-        correctness = gt_answer in model_answer
+        with open(os.path.join(sample_output_dir, "result.txt"), "w", encoding="utf-8") as f:
+            f.write(
+                f"sample_id: {input_file['id']}\n"
+                f"question: {input_file.get('question', '')}\n"
+                f"image_num: {len(images)}\n"
+                f"saved_images:\n" + "\n".join(image_name_lines) + "\n"
+                f"model_output:\n{model_output}\n"
+            )
 
-        with open(os.path.join(output_info_path, f"{input_file['id']}.txt"), "w", encoding="utf-8") as f:
-            f.write(f"model_output: {model_output}\ngt_answer: {gt_answer}\ncorrectness: {correctness}\n")
-        
-        #  breakpoint()
-
-        if correctness:
-            correct_num += 1
-        else:
-            wrong_num += 1
+        processed_num += 1
     
     with open(os.path.join(output_info_path, "sum.txt"), "w", encoding="utf-8") as f:
         f.write(
@@ -165,7 +172,7 @@ def main(args):
             f"sample_size_requested: {args.sample_size}\n"
             f"sample_size_actual: {len(sampled_data)}\n"
             f"sample_seed: {args.sample_seed}\n"
-            f"total: correct {correct_num}, wrong {wrong_num}, accuracy {correct_num/max(correct_num+wrong_num, 1)}\n"
+            f"processed: {processed_num}\n"
         )
 
 
@@ -178,12 +185,12 @@ if __name__ == "__main__":
     parser.add_argument('--sample_size', type=int, default=100)
     parser.add_argument('--sample_seed', type=int, default=42)
     parser.add_argument('--start_from', type=int, default=0)
-    parser.add_argument('--output_path', type=str, default='action_sort_eval_results')
-    parser.add_argument('--other_info', type=str, default='null')
+    parser.add_argument('--output_path', type=str, default='action_sort_observe_output')
+    parser.add_argument('--other_info', type=str, default='image_diff_Qwen3-8B-instruct_zero_shot')
     args = parser.parse_args()
     main(args)
 
 
 '''
-CUDA_VISIBLE_DEVICES=3 python action_sort_test.py --model_name_or_path /dataHW/workspace/fengningya/models/Qwen3-VL-8B-Thinking --other_info Qwen3-VL-8B-Thinking-larger_resolution
+CUDA_VISIBLE_DEVICES=2 python action_sort_test.py --model_name_or_path /dataHW/workspace/fengningya/models/Qwen3-VL-8B-Instruct
 '''

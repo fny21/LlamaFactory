@@ -33,7 +33,7 @@ from transformers.utils import is_torch_bf16_gpu_available, is_torch_npu_availab
 from ..extras import logging
 from ..extras.constants import CHECKPOINT_NAMES, EngineName
 from ..extras.misc import check_dependencies, check_version, get_current_device, is_env_enabled
-from ..extras.packages import is_mcore_adapter_available, is_transformers_version_greater_than
+from ..extras.packages import is_mcore_adapter_available
 from .data_args import DataArguments
 from .evaluation_args import EvaluationArguments
 from .finetuning_args import FinetuningArguments
@@ -100,6 +100,52 @@ def _parse_args(
     return tuple(parsed_args)
 
 
+def _verify_trackio_args(training_args: "TrainingArguments") -> None:
+    """Validates Trackio-specific arguments.
+
+    Args:
+        training_args: TrainingArguments instance (not a dictionary)
+    """
+    report_to = training_args.report_to
+    if not report_to:
+        return
+
+    if isinstance(report_to, str):
+        report_to = [report_to]
+
+    if "trackio" not in report_to:
+        return
+
+    # --- Enforce project (required by Trackio) ---
+    if not training_args.project:
+        raise ValueError("`--project` must be specified when using Trackio.")
+
+    # --- Validate trackio_space_id format ---
+    space_id = training_args.trackio_space_id
+    if space_id:
+        if space_id != "trackio" and "/" not in space_id:
+            logger.warning(
+                f"trackio_space_id '{space_id}' should typically be in format "
+                "'org/space' for Hugging Face Spaces deployment."
+            )
+
+    # --- Inform about default project usage ---
+    if training_args.project == "huggingface":
+        logger.info(
+            "Using default project name 'huggingface'. "
+            "Consider setting a custom project name with --project "
+            "for better organization."
+        )
+
+    # --- Validate hub repo privacy flag ---
+    if training_args.hub_private_repo:
+        logger.info("Repository will be created as private on Hugging Face Hub.")
+
+    # --- Recommend run_name for experiment clarity ---
+    if not training_args.run_name:
+        logger.warning("Consider setting --run_name for better experiment tracking clarity.")
+
+
 def _set_transformers_logging() -> None:
     if os.getenv("LLAMAFACTORY_VERBOSITY", "INFO") in ["DEBUG", "INFO"]:
         transformers.utils.logging.set_verbosity_info()
@@ -146,7 +192,9 @@ def _check_extra_dependencies(
     training_args: Optional["TrainingArguments"] = None,
 ) -> None:
     if model_args.use_kt:
-        check_version("ktransformers", mandatory=True)
+        check_version("kt-kernel", mandatory=True)
+        check_version("transformers-kt", mandatory=True)
+        check_version("accelerate-kt", mandatory=True)
 
     if model_args.use_unsloth:
         check_version("unsloth", mandatory=True)
@@ -278,8 +326,10 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         if finetuning_args.reward_model_type == "lora" and model_args.use_unsloth:
             raise ValueError("Unsloth does not support lora reward model.")
 
-        if training_args.report_to and training_args.report_to[0] not in ["wandb", "tensorboard"]:
-            raise ValueError("PPO only accepts wandb or tensorboard logger.")
+        if training_args.report_to and any(
+            logger not in ("wandb", "tensorboard", "trackio", "none") for logger in training_args.report_to
+        ):
+            raise ValueError("PPO only accepts wandb, tensorboard, or trackio logger.")
 
     if not model_args.use_kt and training_args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
         raise ValueError("Please launch distributed training with `llamafactory-cli` or `torchrun`.")
@@ -346,12 +396,10 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
     if model_args.use_kt and is_deepspeed_zero3_enabled():
         raise ValueError("KTransformers is incompatible with DeepSpeed ZeRO-3.")
 
-    if data_args.neat_packing and is_transformers_version_greater_than("4.53.0"):
-        raise ValueError("Neat packing is incompatible with transformers>=4.53.0.")
-
     _set_env_vars()
     _verify_model_args(model_args, data_args, finetuning_args)
     _check_extra_dependencies(model_args, finetuning_args, training_args)
+    _verify_trackio_args(training_args)
 
     if not finetuning_args.use_mca and training_args.fp8_enable_fsdp_float8_all_gather and not training_args.fp8:
         logger.warning_rank0("fp8_enable_fsdp_float8_all_gather requires fp8=True. Setting fp8=True.")
@@ -421,7 +469,7 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         training_args.resume_from_checkpoint is None
         and training_args.do_train
         and os.path.isdir(training_args.output_dir)
-        and not training_args.overwrite_output_dir
+        and not getattr(training_args, "overwrite_output_dir", False)  # for mca training args and transformers >= 5.0
         and can_resume_from_checkpoint
     ):
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
@@ -463,6 +511,9 @@ def get_train_args(args: dict[str, Any] | list[str] | None = None) -> _TRAIN_CLS
         f"compute dtype: {str(model_args.compute_dtype)}"
     )
     transformers.set_seed(training_args.seed)
+
+    if model_args.use_kt:
+        model_args.apply_kt_config(finetuning_args, training_args, model_args.model_max_length)
 
     return model_args, data_args, training_args, finetuning_args, generating_args
 

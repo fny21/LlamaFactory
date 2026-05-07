@@ -189,3 +189,6 @@ puzzle_dataset/
 action_sort_observe_output/
 action_sort_with_image_diff/
 task_progress_eval_results/
+task_progress_with_image_diff/
+data/
+scripts/

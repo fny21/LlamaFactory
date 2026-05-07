@@ -217,6 +217,25 @@ def get_sample_id(input_file):
     return os.path.splitext(os.path.basename(current_path))[0]
 
 
+def load_cached_qwen_api_diff(cache_path):
+    if not os.path.exists(cache_path):
+        return None
+
+    with open(cache_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if "diff_raw_output" not in data:
+        return None
+
+    return data
+
+
+def save_cached_qwen_api_diff(cache_path, payload):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 def main(args):
     if args.use_qwen_vl_api:
         qwen_client = QwenClient()
@@ -243,6 +262,12 @@ def main(args):
 
     output_info_path = os.path.join(args.output_path, args.other_info)
     os.makedirs(output_info_path, exist_ok=True)
+
+    if args.qwen_api_cache_dir is None:
+        qwen_api_cache_dir = os.path.join(args.output_path, "qwen_api_diff_cache")
+    else:
+        qwen_api_cache_dir = args.qwen_api_cache_dir
+    os.makedirs(qwen_api_cache_dir, exist_ok=True)
 
     candidate_data = data_list[args.start_from:]
     sample_size = min(args.sample_size, len(candidate_data))
@@ -271,20 +296,49 @@ def main(args):
         initial_image.save(initial_save_path)
         current_image.save(current_save_path)
 
-        if args.use_qwen_vl_api:
-            compare_content = build_api_compare_content(qwen_client, initial_image_path, current_image_path)
-            diff_output = qwen_client.chat_with_image(input_content=compare_content)
-        else:
-            diff_output = generate_with_messages(
-                local_model,
-                processor,
-                build_local_compare_messages(),
-                images=[initial_image, current_image],
-                max_new_tokens=args.compare_max_new_tokens,
-                device=args.vl_device,
-            )
+        cache_file_path = os.path.join(qwen_api_cache_dir, f"{sample_id}.json")
+        diff_output = None
+        diff_text = None
+        diff_source = None
 
-        diff_text = strip_thinking_text(diff_output)
+        if args.load_qwen_api_diff_from_cache:
+            cached_data = load_cached_qwen_api_diff(cache_file_path)
+            if cached_data is not None:
+                diff_output = cached_data["diff_raw_output"]
+                diff_text = cached_data.get("diff_text", strip_thinking_text(diff_output))
+                diff_source = "qwen_api_cache"
+            elif args.require_qwen_api_diff_cache:
+                raise FileNotFoundError(f"Qwen API diff cache not found: {cache_file_path}")
+
+        if diff_output is None:
+            if args.use_qwen_vl_api:
+                compare_content = build_api_compare_content(qwen_client, initial_image_path, current_image_path)
+                diff_output = qwen_client.chat_with_image(input_content=compare_content)
+                diff_text = strip_thinking_text(diff_output)
+                diff_source = "qwen_api"
+
+                cache_payload = {
+                    "version": 1,
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "sample_id": sample_id,
+                    "initial_image_path": initial_image_path,
+                    "current_image_path": current_image_path,
+                    "diff_model": "qwen_api",
+                    "diff_raw_output": diff_output,
+                    "diff_text": diff_text,
+                }
+                save_cached_qwen_api_diff(cache_file_path, cache_payload)
+            else:
+                diff_output = generate_with_messages(
+                    local_model,
+                    processor,
+                    build_local_compare_messages(),
+                    images=[initial_image, current_image],
+                    max_new_tokens=args.compare_max_new_tokens,
+                    device=args.vl_device,
+                )
+                diff_text = strip_thinking_text(diff_output)
+                diff_source = "local_qwen_vl"
 
         image_diff_data = {
             "version": 1,
@@ -298,7 +352,9 @@ def main(args):
                 "saved_name": "image_02_current.png",
                 "original_path": current_image_path,
             },
-            "diff_model": "qwen_api" if args.use_qwen_vl_api else "local_qwen_vl",
+            "diff_model": "qwen_api" if diff_source in ("qwen_api", "qwen_api_cache") else "local_qwen_vl",
+            "diff_source": diff_source,
+            "qwen_api_cache_file": cache_file_path if diff_source in ("qwen_api", "qwen_api_cache") else None,
             "diff_raw_output": diff_output,
             "diff_text": diff_text,
         }
@@ -383,6 +439,22 @@ if __name__ == "__main__":
     parser.add_argument("--vl_device", type=str, default="cuda:0")
     parser.add_argument("--use_qwen_vl_api", action="store_true", help="Use Qwen API for stage-1 image-diff generation")
     parser.add_argument(
+        "--load_qwen_api_diff_from_cache",
+        action="store_true",
+        help="Load stage-1 diff from local Qwen API cache first (if exists), to avoid repeated Qwen API calls",
+    )
+    parser.add_argument(
+        "--require_qwen_api_diff_cache",
+        action="store_true",
+        help="Require Qwen API cache hit when --load_qwen_api_diff_from_cache is enabled",
+    )
+    parser.add_argument(
+        "--qwen_api_cache_dir",
+        type=str,
+        default=None,
+        help="Directory to store/load Qwen API stage-1 diff cache (default: <output_path>/qwen_api_diff_cache)",
+    )
+    parser.add_argument(
         "--use_deepseek_api",
         "--use_another_language_model_api",
         dest="use_deepseek_api",
@@ -403,6 +475,18 @@ CUDA_VISIBLE_DEVICES=0 python task_progress_with_image_diff.py \
 python task_progress_with_image_diff.py \
   --model_name_or_path /dataHW/workspace/fengningya/models/Qwen3-VL-8B-Instruct \
   --use_qwen_vl_api \
+  --other_info image_diff_qwen_api_final_local_qwen
+
+python task_progress_with_image_diff.py \
+  --model_name_or_path /dataHW/workspace/fengningya/models/Qwen3-VL-8B-Instruct \
+  --load_qwen_api_diff_from_cache \
+  --require_qwen_api_diff_cache \
+  --other_info image_diff_qwen_api_cache_final_local_qwen
+
+python task_progress_with_image_diff.py \
+  --model_name_or_path /dataHW/workspace/fengningya/models/Qwen3-VL-8B-Instruct \
+  --load_qwen_api_diff_from_cache \
+  --require_qwen_api_diff_cache \
   --use_deepseek_api \
-  --other_info image_diff_qwen_api_final_deepseek
+  --other_info image_diff_qwen_api_cache_final_deepseek
 '''
